@@ -239,9 +239,19 @@ final class Settings
 	}
 }
 
-/** Кто открыл программу и пускать ли его. Администраторы портала входят всегда. */
+/**
+ * Кто открыл программу и пускать ли его. Администраторы портала входят всегда.
+ *
+ * Обычно сотрудник известен из сессии портала (cookie). Мобильный Битрикс24 может
+ * открыть программу без этой cookie — тогда сотрудник узнаётся по ключу входа
+ * (AUTH_ID), который портал передаёт программе при каждом открытии, а страница
+ * получает свой пропуск (ticket) для запросов к программе.
+ */
 final class Access
 {
+	/** Сколько живёт пропуск страницы, открытой по ключу входа: смена с запасом. */
+	private const TICKET_TTL = 12 * 3600;
+
 	public static function current(): ?array
 	{
 		global $USER;
@@ -256,6 +266,101 @@ final class Access
 			'admin' => (bool)$USER->IsAdmin(),
 			'name' => $name !== '' ? $name : (string)$USER->GetLogin(),
 		];
+	}
+
+	/** Сотрудник по ID: только активный. Администратор — в группе 1, как у $USER->IsAdmin(). */
+	public static function byId(int $id): ?array
+	{
+		if ($id <= 0)
+		{
+			return null;
+		}
+		$row = UserTable::getList([
+			'select' => ['ID', 'LOGIN', 'NAME', 'LAST_NAME'],
+			'filter' => ['=ID' => $id, '=ACTIVE' => 'Y'],
+		])->fetch();
+		if (!$row)
+		{
+			return null;
+		}
+		$name = Text::clean($row['NAME'] . ' ' . $row['LAST_NAME']);
+
+		return [
+			'id' => (int)$row['ID'],
+			'admin' => in_array(1, array_map('intval', (array)\CUser::GetUserGroup($id)), true),
+			'name' => $name !== '' ? $name : (string)$row['LOGIN'],
+		];
+	}
+
+	/**
+	 * Сотрудник по ключу входа, который портал передал программе (AUTH_ID).
+	 * Ключ проверяет сам портал, и выдан он должен быть именно этой программе:
+	 * ключ другого приложения портала сюда не пускает.
+	 */
+	public static function fromAppToken(string $token): array
+	{
+		Portal::need('rest');
+		$auth = [];
+		$scope = defined('CRestUtil::GLOBAL_SCOPE') ? \CRestUtil::GLOBAL_SCOPE : '_global';
+		if (\CRestUtil::checkAuth(['auth' => $token], $scope, $auth) !== true || !empty($auth['error']))
+		{
+			$reason = Text::scalar($auth['error_description'] ?? '') ?: Text::scalar($auth['error'] ?? '');
+			throw new AppError('Портал не принял ключ входа' . ($reason !== '' ? ' (' . $reason . ')' : ''));
+		}
+		if (!App::isOurClient(Text::scalar($auth['client_id'] ?? '')))
+		{
+			throw new AppError('Ключ входа выдан другому приложению портала');
+		}
+		$user = self::byId((int)Text::scalar($auth['user_id'] ?? 0));
+		if ($user === null)
+		{
+			throw new AppError('Сотрудник по ключу входа не найден или отключён');
+		}
+
+		return $user;
+	}
+
+	/** Пропуск страницы: ID сотрудника и срок, подписанные ключом программы. */
+	public static function ticket(array $user): string
+	{
+		$payload = self::b64((string)json_encode(['u' => $user['id'], 'e' => time() + self::TICKET_TTL]));
+
+		return $payload . '.' . self::sign($payload);
+	}
+
+	/** Сотрудник по пропуску страницы. Подпись не сошлась или срок вышел — null. */
+	public static function fromTicket(string $ticket): ?array
+	{
+		$parts = explode('.', $ticket);
+		if (count($parts) !== 2 || !hash_equals(self::sign($parts[0]), $parts[1]))
+		{
+			return null;
+		}
+		$data = json_decode((string)base64_decode(strtr($parts[0], '-_', '+/')), true);
+		if (!is_array($data) || (int)($data['e'] ?? 0) < time())
+		{
+			return null;
+		}
+
+		return self::byId((int)($data['u'] ?? 0));
+	}
+
+	private static function sign(string $payload): string
+	{
+		$key = (string)Option::get(Store::MODULE, 'ticket_key', '');
+		if (strlen($key) < 64)
+		{
+			// Ключ создаётся один раз и живёт в настройках портала; файлы программы его не содержат.
+			$key = bin2hex(random_bytes(32));
+			Option::set(Store::MODULE, 'ticket_key', $key);
+		}
+
+		return self::b64(hash_hmac('sha256', $payload, $key, true));
+	}
+
+	private static function b64(string $data): string
+	{
+		return rtrim(strtr(base64_encode($data), '+/', '-_'), '=');
 	}
 
 	public static function allowed(): array
@@ -276,6 +381,57 @@ final class Access
 	public static function revoke(int $id): void
 	{
 		Store::set('users', array_values(array_diff(self::allowed(), [$id])));
+	}
+}
+
+/**
+ * Эта программа в «Приложениях» портала (b_rest_app). Своя запись узнаётся по адресу
+ * обработчика, а не по коду client_id: на тестовом и боевом портале коды разные.
+ */
+final class App
+{
+	/** Записи приложений, чей обработчик — эта программа. */
+	public static function records(): array
+	{
+		Portal::need('rest');
+		$out = [];
+		$rows = \Bitrix\Rest\AppTable::getList(['select' => ['*']]);
+		while ($row = $rows->fetch())
+		{
+			if (self::isOurUrl((string)($row['URL'] ?? '')))
+			{
+				$out[] = $row;
+			}
+		}
+
+		return $out;
+	}
+
+	public static function isOurClient(string $clientId): bool
+	{
+		if ($clientId === '')
+		{
+			return false;
+		}
+		$row = \Bitrix\Rest\AppTable::getList([
+			'select' => ['ID', 'URL'],
+			'filter' => ['=CLIENT_ID' => $clientId],
+		])->fetch();
+
+		return $row && self::isOurUrl((string)$row['URL']);
+	}
+
+	public static function isOurUrl(string $url): bool
+	{
+		return $url !== '' && self::path($url) === self::path(url('index.php'));
+	}
+
+	/** Путь без index.php и косой в конце: «…/priemka/», «…/priemka/index.php» — одно и то же. */
+	private static function path(string $url): string
+	{
+		$path = str_replace('\\', '/', (string)parse_url($url, PHP_URL_PATH));
+
+		return mb_strtolower((string)preg_replace('~/+(index\.php)?$~i', '', $path));
 	}
 }
 
@@ -761,6 +917,7 @@ final class Diagnostics
 			'portal' => 'Портал',
 			'catalog' => 'Каталог техники',
 			'stores' => 'Склады',
+			'mobile' => 'Мобильный Битрикс24',
 		];
 		$out = [];
 		foreach ($blocks as $method => $title)
@@ -795,6 +952,46 @@ final class Diagnostics
 			: $r->warn('Портал открыт по http: браузеры не дают сайтам на http микрофон. Голос — через диктовку клавиатуры'
 				. ' телефона (кнопка «Надиктовать» подскажет, где она). На https запись заработает в самой программе');
 		$r->info('Фото и дефекты пока никуда не отправляются: «Отправить» — заглушка, проверяет только заполнение');
+	}
+
+	private static function mobile(array $s, Report $r): void
+	{
+		$apps = App::records();
+		if (!$apps)
+		{
+			$r->warn('Среди приложений портала нет программы с обработчиком ' . url('index.php')
+				. ' — проверьте «Путь вашего обработчика» в настройках приложения');
+
+			return;
+		}
+		$request = Application::getInstance()->getContext()->getRequest();
+		$host = mb_strtolower((string)$request->getHttpHost());
+		foreach ($apps as $app)
+		{
+			$handler = (string)$app['URL'];
+			$r->info('Обработчик: ' . $handler);
+			Text::flag($app['MOBILE'] ?? '')
+				? $r->ok('Отмечено «Поддерживает BitrixMobile» — пункт есть в мобильном Битрикс24')
+				: $r->warn('Не отмечено «Поддерживает BitrixMobile» — в мобильном Битрикс24 программы не будет');
+			$handlerHost = mb_strtolower((string)parse_url($handler, PHP_URL_HOST));
+			$handlerPort = parse_url($handler, PHP_URL_PORT);
+			if ($handlerPort)
+			{
+				$handlerHost .= ':' . $handlerPort;
+			}
+			if ($handlerHost !== '' && $handlerHost !== $host)
+			{
+				$r->warn('Обработчик на ' . $handlerHost . ', а портал открыт на ' . $host
+					. ': телефон откроет программу без сессии портала. Адрес обработчика должен быть на том же домене');
+			}
+			mb_strtolower((string)parse_url($handler, PHP_URL_SCHEME)) === 'https'
+				? $r->ok('Обработчик на https — мобильный Битрикс24 открывает его и на Android, и на iPhone')
+				: $r->warn('Обработчик на http. Если мобильный Битрикс24 подключён к порталу по https, окно программы'
+					. ' останется белым: страницу http внутри https телефон не показывает. iPhone может не открыть http совсем.'
+					. ' Надёжно — https и в адресе обработчика, и в подключении телефона');
+		}
+		$r->info('В мобильном Битрикс24 программа узнаёт сотрудника по ключу входа, который портал передаёт при открытии,'
+			. ' — даже если окно открылось без сессии портала');
 	}
 
 	private static function catalog(array $s, Report $r): void
@@ -929,8 +1126,9 @@ final class Report
 // ---------- ответы странице ----------
 
 /**
- * JSON для страницы (index.php?action=…). Кто спрашивает — из сессии портала,
- * плюс сверка ключа сессии Битрикса. Доступ проверяется на КАЖДОМ запросе:
+ * JSON для страницы (index.php?action=…). Кто спрашивает — из сессии портала
+ * плюс сверка ключа сессии Битрикса, а если страница открыта по ключу входа —
+ * из её пропуска (Access::ticket). Доступ проверяется на КАЖДОМ запросе:
  * снятый сотрудник теряет его сразу, а не когда обновит страницу.
  */
 final class Api
@@ -944,15 +1142,29 @@ final class Api
 			{
 				throw new AppError('Нужен POST-запрос');
 			}
-			if ($user === null)
-			{
-				throw new AppError('Сессия портала закончилась — откройте программу заново');
-			}
 			$input = json_decode((string)file_get_contents('php://input'), true);
 			$input = is_array($input) ? $input : [];
-			if (!hash_equals((string)bitrix_sessid(), Text::scalar($input['sessid'] ?? '')))
+			$ticket = Text::scalar($input['ticket'] ?? '');
+			if ($ticket !== '')
 			{
-				throw new AppError('Страница устарела — обновите её');
+				// Страница открыта по ключу входа (мобильный Битрикс24 без сессии портала).
+				// Пропуск идёт в теле запроса, не в cookie, — чужой сайт его не подставит.
+				$user = Access::fromTicket($ticket);
+				if ($user === null)
+				{
+					throw new AppError('Вход устарел — закройте программу и откройте её заново');
+				}
+			}
+			else
+			{
+				if ($user === null)
+				{
+					throw new AppError('Сессия портала закончилась — откройте программу заново');
+				}
+				if (!hash_equals((string)bitrix_sessid(), Text::scalar($input['sessid'] ?? '')))
+				{
+					throw new AppError('Страница устарела — обновите её');
+				}
 			}
 			$answer = ['ok' => true, 'data' => self::dispatch(Text::scalar($_GET['action'] ?? ''), $input, $user)];
 		}

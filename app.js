@@ -75,7 +75,8 @@ async function api(action, body = {}) {
       method: "POST",
       credentials: "same-origin",
       headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({...body, sessid: BOOT.sessid}),
+      // ticket — пропуск страницы, открытой по ключу входа (мобильный Битрикс24 без сессии портала).
+      body: JSON.stringify({...body, sessid: BOOT.sessid, ticket: BOOT.ticket || undefined}),
     });
     text = await response.text();
   } catch (_) {

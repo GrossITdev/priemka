@@ -4,6 +4,9 @@
  *
  * Без ?action= — страница программы, с ?action= — JSON для неё (см. Api в lib.php).
  * Пускает сотрудников из списка доступа и администраторов портала.
+ *
+ * Кто открыл: из сессии портала. Мобильный Битрикс24 может открыть программу без неё —
+ * тогда по ключу входа AUTH_ID, который портал передаёт обработчику при открытии.
  */
 
 define('NO_KEEP_STATISTIC', true);
@@ -15,7 +18,9 @@ require __DIR__ . '/lib.php';
 
 use Gross\Priemka\Access;
 use Gross\Priemka\Api;
+use Gross\Priemka\AppError;
 use Gross\Priemka\Catalog;
+use Gross\Priemka\Text;
 use function Gross\Priemka\e;
 use function Gross\Priemka\js;
 use function Gross\Priemka\url;
@@ -28,17 +33,40 @@ if (isset($_GET['action']))
 	die();
 }
 
+// Без сессии портала. Из портала (и из мобильного Битрикс24) обработчик получает ключ входа:
+// по нему узнаём сотрудника и выдаём странице пропуск. Ключа нет — файл открыли напрямую.
+$ticket = '';
+$loginError = '';
 if ($user === null)
 {
-	LocalRedirect('/auth/?backurl=' . urlencode((string)$_SERVER['REQUEST_URI']));
+	$token = Text::scalar($_POST['AUTH_ID'] ?? $_GET['AUTH_ID'] ?? '');
+	if ($token === '')
+	{
+		LocalRedirect('/auth/?backurl=' . urlencode((string)$_SERVER['REQUEST_URI']));
+	}
+	try
+	{
+		$user = Access::fromAppToken($token);
+		$ticket = Access::ticket($user);
+	}
+	catch (AppError $e)
+	{
+		$loginError = $e->getMessage();
+	}
+	catch (\Throwable $e)
+	{
+		error_log('gross.priemka: ' . $e);
+		$loginError = 'Сбой проверки входа — подробности в журнале сервера';
+	}
 }
 
-$canUse = Access::canUse($user);
-$admin = $user['admin'];
+$canUse = $user !== null && Access::canUse($user);
+$admin = $user !== null && $user['admin'];
 
 $boot = [
 	'api' => url('index.php'),
 	'sessid' => bitrix_sessid(),
+	'ticket' => $ticket,
 	'user' => $user,
 	'minQuery' => Catalog::MIN_QUERY,
 	'minProbe' => Catalog::MIN_PROBE,
@@ -72,7 +100,16 @@ header('Cache-Control: no-store');
 </head>
 <body>
 
-<?php if (!$canUse): ?>
+<?php if ($user === null): ?>
+<div class="login-view">
+  <div class="login-card">
+    <h1>Приёмка техники</h1>
+    <p class="sub"><b>Не получилось войти.</b> <?= e($loginError) ?>.</p>
+    <p class="sub">Закройте программу и откройте её снова из меню портала. Не помогло — откройте портал
+      в браузере и войдите в программу оттуда, а администратору перешлите текст выше.</p>
+  </div>
+</div>
+<?php elseif (!$canUse): ?>
 <div class="login-view">
   <div class="login-card">
     <h1>Приёмка техники</h1>
