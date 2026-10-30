@@ -879,7 +879,7 @@ async function saveSettings() {
 }
 
 async function resetSettings() {
-  if (!confirm("Вернуть настройки поиска к значениям по умолчанию (тестовый портал)?")) return;
+  if (!confirm("Вернуть настройки поиска к значениям по умолчанию (каталог 15, папки 391 и 466)?")) return;
   try {
     renderSettings(await api("admin.settings.reset"));
     toast("Настройки сброшены.", "ok");
