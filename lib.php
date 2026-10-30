@@ -385,6 +385,49 @@ final class Access
 }
 
 /**
+ * Последние открытия программы — для вкладки «Проверка». Видно, дошёл ли телефон
+ * до программы вообще (белый экран без строки здесь — запрос не дошёл) и чем кончился вход.
+ */
+final class Visits
+{
+	private const KEEP = 12;
+
+	public static function add(?array $user, bool $ok, string $result): void
+	{
+		try
+		{
+			$request = Application::getInstance()->getContext()->getRequest();
+			$ua = Text::clean((string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
+			$mobile = (bool)preg_match('/BitrixMobile|Bitrix24/i', $ua);
+			$os = preg_match('/iphone|ipad|ipod/i', $ua) ? 'iPhone' : (preg_match('/android/i', $ua) ? 'Android'
+				: (preg_match('/windows/i', $ua) ? 'Windows' : (preg_match('/macintosh/i', $ua) ? 'Mac' : '')));
+			$items = Store::get('visits');
+			array_unshift($items, [
+				'at' => time(),
+				'user' => $user['name'] ?? '',
+				'client' => ($mobile ? 'мобильный Битрикс24' : 'браузер') . ($os !== '' ? ', ' . $os : ''),
+				'mobile' => $mobile,
+				'url' => ($request->isHttps() ? 'https' : 'http') . '://' . $request->getHttpHost(),
+				'ok' => $ok,
+				'result' => $result,
+				'ua' => mb_substr($ua, 0, 300),
+			]);
+			Store::set('visits', array_slice($items, 0, self::KEEP));
+		}
+		catch (\Throwable $e)
+		{
+			// Журнал — подсказка для проверки: его сбой не должен мешать открыть программу.
+			error_log('gross.priemka: ' . $e);
+		}
+	}
+
+	public static function list(): array
+	{
+		return array_values(array_filter(Store::get('visits'), 'is_array'));
+	}
+}
+
+/**
  * Эта программа в «Приложениях» портала (b_rest_app). Своя запись узнаётся по адресу
  * обработчика, а не по коду client_id: на тестовом и боевом портале коды разные.
  */
@@ -918,6 +961,7 @@ final class Diagnostics
 			'catalog' => 'Каталог техники',
 			'stores' => 'Склады',
 			'mobile' => 'Мобильный Битрикс24',
+			'visits' => 'Последние открытия программы',
 		];
 		$out = [];
 		foreach ($blocks as $method => $title)
@@ -952,6 +996,33 @@ final class Diagnostics
 			: $r->warn('Портал открыт по http: браузеры не дают сайтам на http микрофон. Голос — через диктовку клавиатуры'
 				. ' телефона (кнопка «Надиктовать» подскажет, где она). На https запись заработает в самой программе');
 		$r->info('Фото и дефекты пока никуда не отправляются: «Отправить» — заглушка, проверяет только заполнение');
+	}
+
+	private static function visits(array $s, Report $r): void
+	{
+		$items = Visits::list();
+		if (!$items)
+		{
+			$r->info('Открытий пока не было. Откройте программу на телефоне и нажмите «Проверить заново»');
+
+			return;
+		}
+		$r->info('Открыли программу на телефоне, а строки «мобильный Битрикс24» здесь нет — телефон до программы'
+			. ' не дошёл. Чаще всего это http внутри https: смотрите блок «Мобильный Битрикс24» выше');
+		foreach ($items as $visit)
+		{
+			$line = date('d.m H:i:s', (int)($visit['at'] ?? 0))
+				. ' · ' . (Text::scalar($visit['user'] ?? '') ?: 'сотрудник не известен')
+				. ' · ' . Text::scalar($visit['client'] ?? '')
+				. ' · ' . Text::scalar($visit['url'] ?? '')
+				. ' · ' . Text::scalar($visit['result'] ?? '');
+			$ok = Text::flag($visit['ok'] ?? false);
+			$ok ? $r->ok($line) : $r->warn($line);
+			if (Text::flag($visit['mobile'] ?? false) && Text::scalar($visit['ua'] ?? '') !== '')
+			{
+				$r->info('Браузер: ' . Text::scalar($visit['ua']));
+			}
+		}
 	}
 
 	private static function mobile(array $s, Report $r): void

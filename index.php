@@ -21,6 +21,7 @@ use Gross\Priemka\Api;
 use Gross\Priemka\AppError;
 use Gross\Priemka\Catalog;
 use Gross\Priemka\Text;
+use Gross\Priemka\Visits;
 use function Gross\Priemka\e;
 use function Gross\Priemka\js;
 use function Gross\Priemka\url;
@@ -37,17 +38,20 @@ if (isset($_GET['action']))
 // по нему узнаём сотрудника и выдаём странице пропуск. Ключа нет — файл открыли напрямую.
 $ticket = '';
 $loginError = '';
+$via = 'вошёл по сессии портала';
 if ($user === null)
 {
 	$token = Text::scalar($_POST['AUTH_ID'] ?? $_GET['AUTH_ID'] ?? '');
 	if ($token === '')
 	{
+		Visits::add(null, false, 'нет ни сессии портала, ни ключа входа — отправлен на страницу входа портала');
 		LocalRedirect('/auth/?backurl=' . urlencode((string)$_SERVER['REQUEST_URI']));
 	}
 	try
 	{
 		$user = Access::fromAppToken($token);
 		$ticket = Access::ticket($user);
+		$via = 'вошёл по ключу входа (без сессии портала)';
 	}
 	catch (AppError $e)
 	{
@@ -62,6 +66,7 @@ if ($user === null)
 
 $canUse = $user !== null && Access::canUse($user);
 $admin = $user !== null && $user['admin'];
+Visits::add($user, $canUse, $user === null ? 'не вошёл: ' . $loginError : ($canUse ? $via : $via . ', но нет доступа к программе'));
 
 $boot = [
 	'api' => url('index.php'),
